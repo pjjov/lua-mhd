@@ -329,3 +329,96 @@ static MHD_Result_t access_handler(
 
     return res_send(req);
 }
+
+/*
+--------------------------------------------------------------------
+The handler script must be loaded separately from the main Lua state
+--------------------------------------------------------------------
+*/
+
+static struct MHD_Daemon *mhd_start(int port, void *user) {
+    return MHD_start_daemon(
+        MHD_USE_THREAD_PER_CONNECTION | MHD_USE_INTERNAL_POLLING_THREAD,
+        (uint16_t)port,
+        NULL,
+        NULL,
+        access_handler,
+        user,
+        MHD_OPTION_NOTIFY_COMPLETED,
+        req_free,
+        NULL,
+        MHD_OPTION_END
+    );
+}
+
+static int mhd_wrap(lua_State *L, int port, char *script, size_t length) {
+    LuaMHDServer *srv = lua_newuserdata(L, sizeof(LuaMHDServer));
+    memset(srv, 0, sizeof(*srv));
+    srv->port = port;
+    srv->script = script;
+    srv->length = length;
+    srv->daemon = mhd_start(port, srv);
+
+    luaL_getmetatable(L, LUA_MHD_SERVER);
+    lua_setmetatable(L, -2);
+
+    if (!srv->daemon) {
+        free(script);
+        return luaL_error(L, "MHD_start_daemon failed on port %d", srv->port);
+    }
+
+    return 1;
+}
+
+static int l_mhd_load(lua_State *L) {
+    size_t length;
+    int port = (int)luaL_checkinteger(L, 1);
+    const char *script = luaL_checklstring(L, 2, &length);
+    return mhd_wrap(L, port, strdup(script), length);
+}
+
+static int l_mhd_loadfile(lua_State *L) {
+    int port = (int)luaL_checkinteger(L, 1);
+    const char *path = luaL_checkstring(L, 2);
+    FILE *f;
+    char *buf;
+
+    if (!(f = fopen(path, "rb")))
+        return luaL_error(L, "Unable to open file at '%s'.", path);
+
+    fseek(f, 0, SEEK_END);
+    size_t size = ftell(f);
+    fseek(f, 0, SEEK_SET);
+
+    if (!(buf = malloc(size))) {
+        fclose(f);
+        return luaL_error(L, "Out of memory!");
+    }
+
+    size_t len = fread(buf, 1, size, f);
+    fclose(f);
+    return mhd_wrap(L, port, buf, len);
+}
+
+static int func_writer(lua_State *L, const void *p, size_t sz, void *ud) {
+    (void)L;
+    Buffer *buf = (Buffer *)ud;
+    buffer_append(buf, p, sz);
+    return 0;
+}
+
+static int l_mhd_start(lua_State *L) {
+    if (!lua_isfunction(L, -1))
+        return luaL_error(L, "Expected a function to start the MHD server!");
+
+    int port = (int)luaL_checkinteger(L, 1);
+
+    Buffer buf;
+    buf.data = NULL;
+    buf.length = 0;
+    buf.capacity = 0;
+
+    int rc = lua_dump(L, func_writer, &buf, 0);
+
+    return mhd_wrap(L, port, buf.data, buf.length);
+}

@@ -422,3 +422,66 @@ static int l_mhd_start(lua_State *L) {
 
     return mhd_wrap(L, port, buf.data, buf.length);
 }
+
+static int server_stop(lua_State *L) {
+    LuaMHDServer *srv = luaL_checkudata(L, 1, LUA_MHD_SERVER);
+
+    if (srv->daemon) {
+        MHD_stop_daemon(srv->daemon);
+        srv->daemon = NULL;
+    }
+
+    return 0;
+}
+
+static int server_gc(lua_State *L) {
+    LuaMHDServer *srv = luaL_checkudata(L, 1, LUA_MHD_SERVER);
+
+    if (srv->daemon) {
+        MHD_stop_daemon(srv->daemon);
+        srv->daemon = NULL;
+    }
+
+    free(srv->script);
+    srv->script = NULL;
+    return 0;
+}
+
+static int server_tostring(lua_State *L) {
+    LuaMHDServer *srv = luaL_checkudata(L, 1, LUA_MHD_SERVER);
+    lua_pushfstring(
+        L,
+        "lua_mhd.Server(port=%d, running=%s)",
+        srv->port,
+        srv->daemon ? "true" : "false"
+    );
+    return 1;
+}
+
+static const luaL_Reg serverMethods[] = {
+    { "stop", server_stop },
+    { "__gc", server_gc },
+    { "__tostring", server_tostring },
+    { NULL, NULL },
+};
+
+static const luaL_Reg mhdMethods[] = {
+    { "start", l_mhd_start },
+    { "load", l_mhd_load },
+    { "loadfile", l_mhd_loadfile },
+    { NULL, NULL },
+};
+
+int luaopen_mhd(lua_State *L) {
+    luaL_newmetatable(L, LUA_MHD_SERVER);
+    lua_pushvalue(L, -1);
+    lua_setfield(L, -2, "__index");
+    luaL_setfuncs(L, serverMethods, 0);
+    lua_pop(L, 1);
+
+    luaL_newlib(L, mhdMethods);
+    lua_pushfstring(L, "%08x", (unsigned int)MHD_VERSION);
+    lua_setfield(L, -2, "version");
+
+    return 1;
+}

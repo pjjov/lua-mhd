@@ -2,43 +2,44 @@ package = "lua-mhd"
 version = "1.0-1"
 
 source = {
-   url = "git://github.com/pjjov/lua-mhd"
+  url = "git+https://github.com/pjjov/lua-mhd.git",
+  tag = "v1"
 }
 
 description = {
-   summary = "Lua wrapper for libmicrohttpd",
-   detailed = [[
+  summary = "Lua wrapper for libmicrohttpd",
+  detailed = [[
 Lua wrapper for GNU libmicrohttpd that uses multiple Lua
 states for handling requests across multiple worker threads.
 ]],
-   homepage = "https://github.com/pjjov/lua-mhd",
-   license = "LGPL-3.0-or-later"
+  homepage = "https://github.com/pjjov/lua-mhd",
+  license = "LGPL-3.0-or-later"
 }
 
 dependencies = {
-   "lua >= 5.1"
+  "lua >= 5.1"
 }
 
 build = {
-   type = "builtin",
+  type = "builtin",
 
-   external_dependencies = {
-      MICROHTTPD = {
-         header = "microhttpd.h",
-         library = "microhttpd"
+  external_dependencies = {
+    MICROHTTPD = {
+      header = "microhttpd.h",
+      library = "microhttpd"
+    }
+  },
+
+  modules = {
+    ["lua-mhd"] = {
+      sources = {
+        "lua-mhd.c"
+      },
+
+      libraries = {
+        "microhttpd",
+        "pthread"
       }
-   },
-
-   modules = {
-      mhd = {
-         sources = {
-            "lua-mhd.c"
-         },
-
-         libraries = {
-            "microhttpd",
-            "pthread"
-         }
-      }
-   }
+    }
+  }
 }

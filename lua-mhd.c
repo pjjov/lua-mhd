@@ -30,11 +30,25 @@ typedef int MHD_Result_t;
 
 #define LUA_MHD_SERVER "lua_mhd.Server"
 
+typedef struct LuaValue {
+    int type;
+    unsigned int length;
+    union {
+        char boolean;
+        char *string;
+        lua_Number number;
+        void *udata;
+    };
+} LuaValue;
+
 typedef struct LuaMHDServer {
     struct MHD_Daemon *daemon;
+    int argc;
     int port;
     char *script;
     size_t length;
+
+    LuaValue argv[];
 } LuaMHDServer;
 
 typedef struct Buffer {
@@ -68,7 +82,25 @@ static void tls_init(void) {
     pthread_key_create(key, tls_destructor);
 }
 
-static lua_State *create_thread_state(const char *script, size_t length) {
+static int mhd_load_args(lua_State *L, LuaMHDServer *srv) {
+    for (int i = 0; i < srv->argc; i++) {
+        LuaValue *arg = &srv->argv[i];
+        switch (arg->type) {
+            /* clang-format off */
+        case LUA_TNONE: case LUA_TNIL: lua_pushnil(L);                   break;
+        case LUA_TBOOLEAN: lua_pushboolean(L, arg->boolean);             break;
+        case LUA_TLIGHTUSERDATA: lua_pushlightuserdata(L, arg->udata);   break;
+        case LUA_TNUMBER: lua_pushnumber(L, arg->number);                break;
+        case LUA_TSTRING:  lua_pushlstring(L, arg->string, arg->length); break;
+        default: return -1;
+            /* clang-format on */
+        }
+    }
+
+    return 0;
+}
+
+static lua_State *create_thread_state(LuaMHDServer *srv) {
     lua_State *L;
 
     if (!(L = luaL_newstate())) {
@@ -78,7 +110,7 @@ static lua_State *create_thread_state(const char *script, size_t length) {
 
     luaL_openlibs(L);
 
-    if (luaL_loadbuffer(L, script, length, "MHD Handler") != LUA_OK) {
+    if (luaL_loadbuffer(L, srv->script, srv->length, "MHD Handler") != LUA_OK) {
         fprintf(
             stderr, "[lua_mhd] Failed to load script: %s\n", lua_tostring(L, -1)
         );
@@ -87,7 +119,14 @@ static lua_State *create_thread_state(const char *script, size_t length) {
         return NULL;
     }
 
-    if (lua_pcall(L, 0, 1, 0) != LUA_OK) {
+    if (mhd_load_args(L, srv)) {
+        fprintf(stderr, "[lua_mhd] Failed to load script arguments!\n");
+
+        lua_close(L);
+        return NULL;
+    }
+
+    if (lua_pcall(L, srv->argc, 1, 0) != LUA_OK) {
         fprintf(
             stderr,
             "[lua_mhd] Failed to pcall script: %s\n",
@@ -108,12 +147,12 @@ static lua_State *create_thread_state(const char *script, size_t length) {
     return L;
 }
 
-static lua_State *get_thread_state(const char *script, size_t length) {
+static lua_State *get_thread_state(LuaMHDServer *srv) {
     pthread_once(&tls_key_once, tls_init);
 
     lua_State *L = (lua_State *)pthread_getspecific(tls_key);
 
-    if (!L && (L = create_thread_state(script, length)))
+    if (!L && (L = create_thread_state(srv)))
         pthread_setspecific(tls_key, L);
 
     return L;
@@ -136,7 +175,7 @@ static void req_error(Request *req, const char *msg) {
 
 static Request *req_new(LuaMHDServer *srv, struct MHD_Connection *conn) {
     Request *req = calloc(1, sizeof(Request));
-    req->state = get_thread_state(srv->script, srv->length);
+    req->state = get_thread_state(srv);
     req->connection = conn;
 
     if (!req->state) {
@@ -351,9 +390,75 @@ static struct MHD_Daemon *mhd_start(int port, void *user) {
     );
 }
 
-static int mhd_wrap(lua_State *L, int port, char *script, size_t length) {
-    LuaMHDServer *srv = lua_newuserdata(L, sizeof(LuaMHDServer));
-    memset(srv, 0, sizeof(*srv));
+static int mhd_save_args(lua_State *L, LuaMHDServer *srv, int idx, int argc) {
+    for (int i = 0; i < argc; i++) {
+        LuaValue *out = &srv->argv[i];
+        switch (lua_type(L, idx + i)) {
+        case LUA_TNONE:
+        case LUA_TNIL:
+            out->type = LUA_TNIL;
+            break;
+        case LUA_TBOOLEAN:
+            out->type = LUA_TBOOLEAN;
+            out->boolean = lua_toboolean(L, idx + i);
+            break;
+        case LUA_TLIGHTUSERDATA:
+            out->type = LUA_TLIGHTUSERDATA;
+            out->udata = lua_touserdata(L, idx + i);
+            break;
+        case LUA_TNUMBER:
+            out->type = LUA_TNUMBER;
+            out->number = lua_tonumber(L, idx + i);
+            break;
+        case LUA_TSTRING: {
+            size_t length;
+            const char *string = lua_tolstring(L, idx + i, &length);
+
+            if (length > UINT_MAX)
+                return -1;
+
+            out->type = LUA_TSTRING;
+            out->length = length;
+            out->string = strdup(string);
+            break;
+        }
+        case LUA_TTABLE:
+        case LUA_TFUNCTION:
+        case LUA_TUSERDATA:
+        case LUA_TTHREAD:
+        default:
+            return -1;
+        }
+    }
+
+    return 0;
+}
+
+static void mhd_free(LuaMHDServer *srv) {
+    if (srv->daemon) {
+        MHD_stop_daemon(srv->daemon);
+        srv->daemon = NULL;
+    }
+
+    for (int i = 0; i < srv->argc; i++) {
+        if (srv->argv[i].type == LUA_TSTRING) {
+            srv->argv[i].type = LUA_TNIL;
+            free(srv->argv[i].string);
+        }
+    }
+
+    free(srv->script);
+    srv->script = NULL;
+}
+
+static int mhd_wrap(
+    lua_State *L, int idx, int port, char *script, size_t length
+) {
+    int argc = lua_gettop(L) - (idx - 1);
+    size_t size = sizeof(LuaMHDServer) + argc * sizeof(LuaValue);
+
+    LuaMHDServer *srv = lua_newuserdata(L, size);
+    memset(srv, 0, size);
     srv->port = port;
     srv->script = script;
     srv->length = length;
@@ -362,8 +467,8 @@ static int mhd_wrap(lua_State *L, int port, char *script, size_t length) {
     luaL_getmetatable(L, LUA_MHD_SERVER);
     lua_setmetatable(L, -2);
 
-    if (!srv->daemon) {
-        free(script);
+    if (!srv->daemon || mhd_save_args(L, srv, idx, argc)) {
+        mhd_free(srv);
         return luaL_error(L, "MHD_start_daemon failed on port %d", srv->port);
     }
 
@@ -374,7 +479,7 @@ static int l_mhd_load(lua_State *L) {
     size_t length;
     int port = (int)luaL_checkinteger(L, 1);
     const char *script = luaL_checklstring(L, 2, &length);
-    return mhd_wrap(L, port, strdup(script), length);
+    return mhd_wrap(L, 3, port, strdup(script), length);
 }
 
 static int l_mhd_loadfile(lua_State *L) {
@@ -397,7 +502,7 @@ static int l_mhd_loadfile(lua_State *L) {
 
     size_t len = fread(buf, 1, size, f);
     fclose(f);
-    return mhd_wrap(L, port, buf, len);
+    return mhd_wrap(L, 3, port, buf, len);
 }
 
 static int func_writer(lua_State *L, const void *p, size_t sz, void *ud) {
@@ -408,7 +513,7 @@ static int func_writer(lua_State *L, const void *p, size_t sz, void *ud) {
 }
 
 static int l_mhd_start(lua_State *L) {
-    if (!lua_isfunction(L, -1))
+    if (!lua_isfunction(L, 2))
         return luaL_error(L, "Expected a function to start the MHD server!");
 
     int port = (int)luaL_checkinteger(L, 1);
@@ -418,9 +523,11 @@ static int l_mhd_start(lua_State *L) {
     buf.length = 0;
     buf.capacity = 0;
 
+    lua_pushvalue(L, 2);
     int rc = lua_dump(L, func_writer, &buf, 0);
+    lua_pop(L, 1);
 
-    return mhd_wrap(L, port, buf.data, buf.length);
+    return mhd_wrap(L, 3, port, buf.data, buf.length);
 }
 
 static int server_stop(lua_State *L) {
@@ -436,14 +543,7 @@ static int server_stop(lua_State *L) {
 
 static int server_gc(lua_State *L) {
     LuaMHDServer *srv = luaL_checkudata(L, 1, LUA_MHD_SERVER);
-
-    if (srv->daemon) {
-        MHD_stop_daemon(srv->daemon);
-        srv->daemon = NULL;
-    }
-
-    free(srv->script);
-    srv->script = NULL;
+    mhd_free(srv);
     return 0;
 }
 

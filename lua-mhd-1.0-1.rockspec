@@ -1,3 +1,11 @@
+-- lua-mhd -- Lua wrapper for libmicrohttpd
+--
+-- Copyright (C) 2026 Предраг Јовановић
+-- SPDX-FileCopyrightText: 2026 Предраг Јовановић
+-- SPDX-License-Identifier: LGPL-3.0-or-later
+--
+-- Look at the COPYING and COPYING.LESSER files for more information.
+
 package = "lua-mhd"
 version = "1.0-1"
 

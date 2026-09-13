@@ -40,14 +40,53 @@ local mhd = require "lua-mhd"
 Three functions are provided for creating a server:
 
 ```lua
-local srv = mhd.load(port, sourceChunk, ...)
-local srv = mhd.loadfile(port, path, ...)
-local srv = mhd.start(port, callback, ...)
+local srv = mhd.load(options, sourceChunk, ...)
+local srv = mhd.loadfile(options, path, ...)
+local srv = mhd.start(options, callback, ...)
 ```
 
-All functions start an HTTP server listening on the specified port.
+All functions start an HTTP server based on the given `options` table.
 
 The additional arguments (`...`) are passed to every worker when it is created.
+
+### Server Options
+
+The `options` table replaces the plain port number and configures the
+underlying `MHD_Daemon`.
+
+| Field                      | Type    | Default | Description                                                              |
+| -------------------------- | ------- | ------- | ------------------------------------------------------------------------ |
+| `port`                     | number  | —       | **Required.** TCP port to listen on.                                     |
+| `thread_pool_size`         | number  | none    | Use a fixed-size internal thread pool instead of one thread per connection. |
+| `single_thread`            | boolean | `false` | Run the daemon on a single internal thread. Mutually exclusive with `thread_pool_size`. |
+| `connection_limit`         | number  | none    | Maximum number of concurrent connections.                                |
+| `connection_timeout`       | number  | none    | Idle connection timeout, in seconds.                                     |
+| `per_ip_connection_limit`  | number  | none    | Maximum number of concurrent connections per client IP.                  |
+| `debug`                    | boolean | `false` | Enable libmicrohttpd's internal debug/verbose logging.                   |
+| `ipv6`                     | boolean | `false` | Listen on IPv6 in addition to IPv4.                                      |
+
+By default (no `thread_pool_size` or `single_thread` given), the daemon uses
+one thread per connection, which matches the [threading model](#threading-model)
+described below. Setting `thread_pool_size` switches to a fixed pool of
+worker threads instead, which is generally more efficient under high
+connection churn while remaining compatible with the thread-local `lua_State`
+model. `single_thread` runs everything, including request handling, on a
+single internal thread — useful for simple or low-traffic servers.
+
+Example:
+
+```lua
+local srv = mhd.start({
+  port = 8080,
+  thread_pool_size = 4,
+  connection_timeout = 30,
+  connection_limit = 1000,
+}, function()
+  return function(req)
+    return { code = 200, body = "Hello, world!" }
+  end
+end)
+```
 
 ### Worker Initialization
 
@@ -74,7 +113,7 @@ end
 `mhd.start` accepts a Lua callback that generates the worker script.
 
 ```lua
-local srv = mhd.start(8080, function(...)
+local srv = mhd.start({ port = 8080 }, function(...)
   return function(req)
     return {
       code = 200,
@@ -108,7 +147,7 @@ return function(req)
 end
 ]]
 
-local srv = mhd.load(8080, source)
+local srv = mhd.load({ port = 8080 }, source)
 ```
 
 ### Using `mhd.loadfile`
@@ -116,7 +155,7 @@ local srv = mhd.load(8080, source)
 Load a worker script from a Lua file:
 
 ```lua
-local srv = mhd.loadfile(8080, "worker.lua")
+local srv = mhd.loadfile({ port = 8080 }, "worker.lua")
 ```
 
 ## Passing Parameters to Workers
@@ -135,7 +174,7 @@ Example:
 
 ```lua
 local srv = mhd.start(
-  8080,
+  { port = 8080 },
   workerScript,
   "production",
   true,
@@ -157,7 +196,7 @@ local config = json.encode({
   timeout = 30
 })
 
-local srv = mhd.start(8080, workerScript, config)
+local srv = mhd.start({ port = 8080 }, workerScript, config)
 ```
 
 The worker can then deserialize the string during initialization.
@@ -174,6 +213,9 @@ Incoming requests are provided as a Lua table:
   headers = {
     ["Content-Type"] = "text/plain"
   },
+  query = {
+    q = "search term"
+  },
   body = "Request body"
 }
 ```
@@ -186,7 +228,11 @@ Incoming requests are provided as a Lua table:
 | `url`     | string | Requested URL         |
 | `version` | string | HTTP protocol version |
 | `headers` | table  | Request headers       |
+| `query`   | table  | Parsed query string parameters |
 | `body`    | string | Request body          |
+
+Note: if a query parameter is repeated (e.g. `?tag=a&tag=b`), only the last
+value is kept in the `query` table.
 
 ## Response Object
 
@@ -228,7 +274,7 @@ local function worker(greeting)
 end
 
 local srv = mhd.start(
-  8080,
+  { port = 8080 },
   worker,
   "Hello, world!"
 )

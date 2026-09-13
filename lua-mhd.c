@@ -7,6 +7,7 @@
     Look at the COPYING and COPYING.LESSER files for more information.
 */
 
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -40,6 +41,34 @@ typedef struct LuaValue {
         void *udata;
     };
 } LuaValue;
+
+/*
+--------------------------------------------------
+Options table accepted as the first argument to
+mhd.load / mhd.loadfile / mhd.start, in place of a
+bare port number.
+--------------------------------------------------
+*/
+
+typedef struct MhdOptions {
+    int port;
+
+    int thread_pool_size;
+    int has_thread_pool_size;
+
+    unsigned int connection_limit;
+    int has_connection_limit;
+
+    unsigned int connection_timeout;
+    int has_connection_timeout;
+
+    unsigned int per_ip_connection_limit;
+    int has_per_ip_connection_limit;
+
+    int single_thread;
+    int debug;
+    int ipv6;
+} MhdOptions;
 
 typedef struct LuaMHDServer {
     struct MHD_Daemon *daemon;
@@ -381,17 +410,143 @@ The handler script must be loaded separately from the main Lua state
 --------------------------------------------------------------------
 */
 
-static struct MHD_Daemon *mhd_start(int port, void *user) {
+static void opt_number_field(
+    lua_State *L, int idx, const char *name, int *has, long *out
+) {
+    lua_getfield(L, idx, name);
+    if (!lua_isnil(L, -1)) {
+        if (!lua_isnumber(L, -1))
+            luaL_error(L, "options.%s must be a number", name);
+        *out = (long)lua_tonumber(L, -1);
+        *has = 1;
+    }
+    lua_pop(L, 1);
+}
+
+static int opt_bool_field(lua_State *L, int idx, const char *name) {
+    lua_getfield(L, idx, name);
+    int truthy = lua_toboolean(L, -1);
+    lua_pop(L, 1);
+    return truthy;
+}
+
+static void parse_options(lua_State *L, int idx, MhdOptions *opts) {
+    long tmp;
+    memset(opts, 0, sizeof(*opts));
+
+    luaL_checktype(L, idx, LUA_TTABLE);
+
+    lua_getfield(L, idx, "port");
+    if (!lua_isinteger(L, -1) && !lua_isnumber(L, -1))
+        luaL_error(L, "options.port is required and must be a number");
+    opts->port = (int)lua_tointeger(L, -1);
+    lua_pop(L, 1);
+
+    opt_number_field(
+        L, idx, "thread_pool_size", &opts->has_thread_pool_size, &tmp
+    );
+    if (opts->has_thread_pool_size)
+        opts->thread_pool_size = (int)tmp;
+
+    opt_number_field(
+        L, idx, "connection_limit", &opts->has_connection_limit, &tmp
+    );
+    if (opts->has_connection_limit)
+        opts->connection_limit = (unsigned int)tmp;
+
+    opt_number_field(
+        L, idx, "connection_timeout", &opts->has_connection_timeout, &tmp
+    );
+    if (opts->has_connection_timeout)
+        opts->connection_timeout = (unsigned int)tmp;
+
+    opt_number_field(
+        L,
+        idx,
+        "per_ip_connection_limit",
+        &opts->has_per_ip_connection_limit,
+        &tmp
+    );
+    if (opts->has_per_ip_connection_limit)
+        opts->per_ip_connection_limit = (unsigned int)tmp;
+
+    opts->single_thread = opt_bool_field(L, idx, "single_thread");
+    opts->debug = opt_bool_field(L, idx, "debug");
+    opts->ipv6 = opt_bool_field(L, idx, "ipv6");
+
+    if (opts->has_thread_pool_size && opts->single_thread)
+        luaL_error(
+            L,
+            "options.thread_pool_size and options.single_thread are "
+            "mutually exclusive"
+        );
+}
+
+static struct MHD_Daemon *mhd_start(MhdOptions *opts, void *user) {
+    unsigned int flags = MHD_USE_INTERNAL_POLLING_THREAD;
+
+    if (opts->ipv6)
+        flags |= MHD_USE_IPv6;
+    if (opts->debug)
+        flags |= MHD_USE_DEBUG;
+
+    /* Thread-per-connection is our default threading model, since worker
+       state is kept in thread-local storage. A thread pool or a single
+       internal thread are also compatible with that model, but cannot be
+       combined with MHD_USE_THREAD_PER_CONNECTION. */
+    if (!opts->has_thread_pool_size && !opts->single_thread)
+        flags |= MHD_USE_THREAD_PER_CONNECTION;
+
+    struct MHD_OptionItem items[6];
+    int n = 0;
+
+    items[n].option = MHD_OPTION_NOTIFY_COMPLETED;
+    items[n].value = (intptr_t)req_free;
+    items[n].ptr_value = NULL;
+    n++;
+
+    if (opts->has_thread_pool_size) {
+        items[n].option = MHD_OPTION_THREAD_POOL_SIZE;
+        items[n].value = (intptr_t)opts->thread_pool_size;
+        items[n].ptr_value = NULL;
+        n++;
+    }
+
+    if (opts->has_connection_limit) {
+        items[n].option = MHD_OPTION_CONNECTION_LIMIT;
+        items[n].value = (intptr_t)opts->connection_limit;
+        items[n].ptr_value = NULL;
+        n++;
+    }
+
+    if (opts->has_connection_timeout) {
+        items[n].option = MHD_OPTION_CONNECTION_TIMEOUT;
+        items[n].value = (intptr_t)opts->connection_timeout;
+        items[n].ptr_value = NULL;
+        n++;
+    }
+
+    if (opts->has_per_ip_connection_limit) {
+        items[n].option = MHD_OPTION_PER_IP_CONNECTION_LIMIT;
+        items[n].value = (intptr_t)opts->per_ip_connection_limit;
+        items[n].ptr_value = NULL;
+        n++;
+    }
+
+    items[n].option = MHD_OPTION_END;
+    items[n].value = 0;
+    items[n].ptr_value = NULL;
+    n++;
+
     return MHD_start_daemon(
-        MHD_USE_THREAD_PER_CONNECTION | MHD_USE_INTERNAL_POLLING_THREAD,
-        (uint16_t)port,
+        flags,
+        (uint16_t)opts->port,
         NULL,
         NULL,
         access_handler,
         user,
-        MHD_OPTION_NOTIFY_COMPLETED,
-        req_free,
-        NULL,
+        MHD_OPTION_ARRAY,
+        items,
         MHD_OPTION_END
     );
 }
@@ -458,17 +613,17 @@ static void mhd_free(LuaMHDServer *srv) {
 }
 
 static int mhd_wrap(
-    lua_State *L, int idx, int port, char *script, size_t length
+    lua_State *L, int idx, MhdOptions *opts, char *script, size_t length
 ) {
     int argc = lua_gettop(L) - (idx - 1);
     size_t size = sizeof(LuaMHDServer) + argc * sizeof(LuaValue);
 
     LuaMHDServer *srv = lua_newuserdata(L, size);
     memset(srv, 0, size);
-    srv->port = port;
+    srv->port = opts->port;
     srv->script = script;
     srv->length = length;
-    srv->daemon = mhd_start(port, srv);
+    srv->daemon = mhd_start(opts, srv);
 
     luaL_getmetatable(L, LUA_MHD_SERVER);
     lua_setmetatable(L, -2);
@@ -483,13 +638,15 @@ static int mhd_wrap(
 
 static int l_mhd_load(lua_State *L) {
     size_t length;
-    int port = (int)luaL_checkinteger(L, 1);
+    MhdOptions opts;
+    parse_options(L, 1, &opts);
     const char *script = luaL_checklstring(L, 2, &length);
-    return mhd_wrap(L, 3, port, strdup(script), length);
+    return mhd_wrap(L, 3, &opts, strdup(script), length);
 }
 
 static int l_mhd_loadfile(lua_State *L) {
-    int port = (int)luaL_checkinteger(L, 1);
+    MhdOptions opts;
+    parse_options(L, 1, &opts);
     const char *path = luaL_checkstring(L, 2);
     FILE *f;
     char *buf;
@@ -508,7 +665,7 @@ static int l_mhd_loadfile(lua_State *L) {
 
     size_t len = fread(buf, 1, size, f);
     fclose(f);
-    return mhd_wrap(L, 3, port, buf, len);
+    return mhd_wrap(L, 3, &opts, buf, len);
 }
 
 static int func_writer(lua_State *L, const void *p, size_t sz, void *ud) {
@@ -522,7 +679,8 @@ static int l_mhd_start(lua_State *L) {
     if (!lua_isfunction(L, 2))
         return luaL_error(L, "Expected a function to start the MHD server!");
 
-    int port = (int)luaL_checkinteger(L, 1);
+    MhdOptions opts;
+    parse_options(L, 1, &opts);
 
     Buffer buf;
     buf.data = NULL;
@@ -533,7 +691,12 @@ static int l_mhd_start(lua_State *L) {
     int rc = lua_dump(L, func_writer, &buf, 0);
     lua_pop(L, 1);
 
-    return mhd_wrap(L, 3, port, buf.data, buf.length);
+    if (rc != 0) {
+        free(buf.data);
+        return luaL_error(L, "Failed to dump worker function (error %d)", rc);
+    }
+
+    return mhd_wrap(L, 3, &opts, buf.data, buf.length);
 }
 
 static int server_stop(lua_State *L) {
@@ -586,7 +749,9 @@ int luaopen_mhd(lua_State *L) {
     lua_pop(L, 1);
 
     luaL_newlib(L, mhdMethods);
-    lua_pushfstring(L, "%08x", (unsigned int)MHD_VERSION);
+    char version[9];
+    snprintf(version, sizeof(version), "%08x", (unsigned int)MHD_VERSION);
+    lua_pushstring(L, version);
     lua_setfield(L, -2, "version");
 
     return 1;

@@ -256,6 +256,12 @@ static int req_push(
     MHD_get_connection_values(req->connection, MHD_HEADER_KIND, header_iter, L);
     lua_setfield(L, -2, "headers");
 
+    lua_newtable(L); /* query params */
+    MHD_get_connection_values(
+        req->connection, MHD_GET_ARGUMENT_KIND, header_iter, L
+    );
+    lua_setfield(L, -2, "query");
+
     if (req->buffer.length > 0)
         lua_pushlstring(L, req->buffer.data, req->buffer.length);
     else

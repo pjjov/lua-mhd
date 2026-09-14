@@ -7,11 +7,11 @@
 -- Look at the COPYING and COPYING.LESSER files for more information.
 
 package = "lua-mhd"
-version = "1.0-1"
+version = "2.0-1"
 
 source = {
   url = "git+https://github.com/pjjov/lua-mhd.git",
-  tag = "v1"
+  tag = "v2.0"
 }
 
 description = {

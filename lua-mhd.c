@@ -12,6 +12,13 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include <fcntl.h>
+#include <strings.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/un.h>
+#include <unistd.h>
+
 #include <microhttpd.h>
 #include <pthread.h>
 
@@ -68,6 +75,20 @@ typedef struct MhdOptions {
     int single_thread;
     int debug;
     int ipv6;
+
+    size_t max_body_size; /* 0 = unlimited */
+
+    /* TLS: pointers alias into the options table's Lua strings and are
+       only valid for the duration of the mhd.start/load/loadfile call. */
+    int has_tls;
+    const char *tls_key;
+    const char *tls_cert;
+    const char *tls_trust;        /* optional: CA / trust chain */
+    const char *tls_key_password; /* optional */
+
+    /* Unix domain socket, in place of a TCP port */
+    const char *unix_socket;
+    long unix_socket_mode; /* -1 = unset/don't chmod */
 } MhdOptions;
 
 typedef struct LuaMHDServer {
@@ -76,6 +97,8 @@ typedef struct LuaMHDServer {
     int port;
     char *script;
     size_t length;
+    size_t max_body_size;
+    char *unix_socket_path;
 
     LuaValue argv[];
 } LuaMHDServer;
@@ -89,7 +112,9 @@ typedef struct Buffer {
 typedef struct Request {
     lua_State *state;
     struct MHD_Connection *connection;
+    LuaMHDServer *server;
     Buffer buffer;
+    int rejected;
 } Request;
 
 /*
@@ -193,22 +218,30 @@ libmicrohttpd request handling
 ------------------------------
 */
 
-static void req_error(Request *req, const char *msg) {
+static enum MHD_Result req_simple_response(
+    Request *req, unsigned int code, const char *msg
+) {
     struct MHD_Response *res = MHD_create_response_from_buffer(
         strlen(msg), (void *)msg, MHD_RESPMEM_PERSISTENT
     );
 
-    MHD_queue_response(req->connection, MHD_HTTP_INTERNAL_SERVER_ERROR, res);
+    enum MHD_Result ret = MHD_queue_response(req->connection, code, res);
     MHD_destroy_response(res);
+    return ret;
 }
 
 static Request *req_new(LuaMHDServer *srv, struct MHD_Connection *conn) {
     Request *req = calloc(1, sizeof(Request));
     req->state = get_thread_state(srv);
     req->connection = conn;
+    req->server = srv;
 
     if (!req->state) {
-        req_error(req, "Internal Server Error: Lua initialization failed");
+        req_simple_response(
+            req,
+            MHD_HTTP_INTERNAL_SERVER_ERROR,
+            "Internal Server Error: Lua initialization failed"
+        );
         free(req);
         return NULL;
     }
@@ -253,7 +286,7 @@ static size_t buffer_append(Buffer *dst, const char *src, size_t len) {
 
     memcpy(dst->data + dst->length, src, len);
     dst->length += len;
-    return 0;
+    return len;
 }
 
 static MHD_Result_t header_iter(
@@ -265,6 +298,53 @@ static MHD_Result_t header_iter(
     lua_pushstring(L, value ? value : "");
     lua_settable(L, -3);
     return MHD_YES;
+}
+
+static int l_req_check_digest(lua_State *L) {
+    Request *req = (Request *)lua_touserdata(L, lua_upvalueindex(1));
+    const char *realm = luaL_checkstring(L, 1);
+    const char *username = luaL_checkstring(L, 2);
+    const char *password = luaL_checkstring(L, 3);
+
+    unsigned int nonce_timeout = 0;
+    enum MHD_DigestAuthMultiAlgo3 algo = MHD_DIGEST_AUTH_MULT_ALGO3_MD5;
+
+    if (lua_istable(L, 4)) {
+        lua_getfield(L, 4, "nonce_timeout");
+        if (lua_isnumber(L, -1))
+            nonce_timeout = (unsigned int)lua_tointeger(L, -1);
+        lua_pop(L, 1);
+
+        lua_getfield(L, 4, "algorithm");
+        if (lua_isstring(L, -1)) {
+            const char *a = lua_tostring(L, -1);
+            if (strcasecmp(a, "sha256") == 0)
+                algo = MHD_DIGEST_AUTH_MULT_ALGO3_SHA256;
+            else if (strcasecmp(a, "any") == 0)
+                algo = MHD_DIGEST_AUTH_MULT_ALGO3_ANY_NON_SESSION;
+        }
+        lua_pop(L, 1);
+    }
+
+    enum MHD_DigestAuthResult r = MHD_digest_auth_check3(
+        req->connection,
+        realm,
+        username,
+        password,
+        nonce_timeout,
+        0,
+        MHD_DIGEST_AUTH_MULT_QOP_AUTH,
+        algo
+    );
+
+    if (r == MHD_DAUTH_OK)
+        lua_pushboolean(L, 1);
+    else if (r == MHD_DAUTH_NONCE_STALE)
+        lua_pushliteral(L, "stale");
+    else
+        lua_pushboolean(L, 0);
+
+    return 1;
 }
 
 static int req_push(
@@ -297,6 +377,43 @@ static int req_push(
         lua_pushstring(L, "");
 
     lua_setfield(L, -2, "body");
+
+    /* HTTP Basic authentication, parsed for convenience. */
+    struct MHD_BasicAuthInfo *basic = MHD_basic_auth_get_username_password3(
+        req->connection
+    );
+    if (basic) {
+        lua_newtable(L);
+        lua_pushlstring(L, basic->username, basic->username_len);
+        lua_setfield(L, -2, "username");
+        if (basic->password)
+            lua_pushlstring(L, basic->password, basic->password_len);
+        else
+            lua_pushnil(L);
+        lua_setfield(L, -2, "password");
+        lua_setfield(L, -2, "basic_auth");
+        MHD_free(basic);
+    }
+
+    /* HTTP Digest authentication: the client-supplied username is exposed
+       so the script can look up the matching password; verification then
+       happens via req.check_digest(realm, username, password). */
+    struct MHD_DigestAuthUsernameInfo *digest = MHD_digest_auth_get_username3(
+        req->connection
+    );
+    if (digest) {
+        if (digest->username)
+            lua_pushlstring(L, digest->username, digest->username_len);
+        else
+            lua_pushnil(L);
+        lua_setfield(L, -2, "digest_username");
+        MHD_free(digest);
+    }
+
+    lua_pushlightuserdata(L, req);
+    lua_pushcclosure(L, l_req_check_digest, 1);
+    lua_setfield(L, -2, "check_digest");
+
     return MHD_YES;
 }
 
@@ -307,8 +424,9 @@ static int req_handle(Request *req) {
         const char *err = lua_tostring(L, -1);
         fprintf(stderr, "[lua_mhd] %s\n", err ? err : "(unknown)");
 
-        req_error(
+        req_simple_response(
             req,
+            MHD_HTTP_INTERNAL_SERVER_ERROR,
             "Internal Script Error: An error occured in the Lua handler "
             "function"
         );
@@ -337,6 +455,61 @@ static void res_add_headers(Request *req, struct MHD_Response *res) {
     lua_pop(L, 1);
 }
 
+/* Finishes a response: queues it normally, or — if the handler set a
+   `digest_challenge` table — turns it into an RFC 7616 challenge instead. */
+static enum MHD_Result res_queue(
+    Request *req, struct MHD_Response *res, unsigned int code
+) {
+    lua_State *L = req->state;
+    enum MHD_Result ret;
+
+    lua_getfield(L, -1, "digest_challenge");
+    if (lua_istable(L, -1)) {
+        int idx = lua_gettop(L);
+
+        lua_getfield(L, idx, "realm");
+        const char *realm = lua_isstring(L, -1) ? lua_tostring(L, -1) : "";
+
+        lua_getfield(L, idx, "opaque");
+        const char *opaque = lua_isstring(L, -1) ? lua_tostring(L, -1) : NULL;
+
+        lua_getfield(L, idx, "stale");
+        int stale = lua_toboolean(L, -1);
+
+        lua_getfield(L, idx, "algorithm");
+        enum MHD_DigestAuthMultiAlgo3 algo = MHD_DIGEST_AUTH_MULT_ALGO3_MD5;
+        if (lua_isstring(L, -1)) {
+            const char *a = lua_tostring(L, -1);
+            if (strcasecmp(a, "sha256") == 0)
+                algo = MHD_DIGEST_AUTH_MULT_ALGO3_SHA256;
+            else if (strcasecmp(a, "any") == 0)
+                algo = MHD_DIGEST_AUTH_MULT_ALGO3_ANY_NON_SESSION;
+        }
+
+        ret = MHD_queue_auth_required_response3(
+            req->connection,
+            realm,
+            opaque,
+            NULL,
+            res,
+            stale,
+            MHD_DIGEST_AUTH_MULT_QOP_AUTH,
+            algo,
+            0,
+            0
+        );
+
+        lua_pop(L, 5); /* algorithm, stale, opaque, realm, digest_challenge */
+        MHD_destroy_response(res);
+        return ret;
+    }
+    lua_pop(L, 1); /* digest_challenge (nil) */
+
+    ret = MHD_queue_response(req->connection, code, res);
+    MHD_destroy_response(res);
+    return ret;
+}
+
 static enum MHD_Result res_send(Request *req) {
     lua_State *L = req->state;
     lua_getfield(L, -1, "code");
@@ -348,6 +521,38 @@ static enum MHD_Result res_send(Request *req) {
 
     unsigned int code = (unsigned int)lua_tointeger(L, -1);
     lua_pop(L, 1);
+
+    /* Static file serving: { code = 200, file = "/path/to/file" } lets MHD
+       stream the file directly (via sendfile where supported) instead of
+       the script reading it into a Lua string. */
+    lua_getfield(L, -1, "file");
+    if (lua_isstring(L, -1)) {
+        const char *path = lua_tostring(L, -1);
+        int fd = open(path, O_RDONLY);
+        lua_pop(L, 1); /* file */
+
+        if (fd < 0)
+            return req_simple_response(req, MHD_HTTP_NOT_FOUND, "Not Found");
+
+        struct stat st;
+        if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode)) {
+            close(fd);
+            return req_simple_response(req, MHD_HTTP_NOT_FOUND, "Not Found");
+        }
+
+        struct MHD_Response *res = MHD_create_response_from_fd64(
+            (uint64_t)st.st_size, fd
+        );
+
+        if (!res) {
+            close(fd);
+            return MHD_NO;
+        }
+
+        res_add_headers(req, res);
+        return res_queue(req, res, code);
+    }
+    lua_pop(L, 1); /* file (nil) */
 
     lua_getfield(L, -1, "body");
     size_t length = 0;
@@ -364,9 +569,7 @@ static enum MHD_Result res_send(Request *req) {
         return MHD_NO;
 
     res_add_headers(req, res);
-    enum MHD_Result ret = MHD_queue_response(req->connection, code, res);
-    MHD_destroy_response(res);
-    return ret;
+    return res_queue(req, res, code);
 }
 
 static MHD_Result_t access_handler(
@@ -389,12 +592,26 @@ static MHD_Result_t access_handler(
     }
 
     if (*upload_data_size > 0) {
+        if (!req->rejected && srv->max_body_size > 0
+            && req->buffer.length + *upload_data_size > srv->max_body_size)
+            req->rejected = 1;
+
+        if (req->rejected) {
+            *upload_data_size = 0;
+            return MHD_YES;
+        }
+
         size_t recv = buffer_append(
             &req->buffer, upload_data, *upload_data_size
         );
         *upload_data_size -= recv;
         return MHD_YES;
     }
+
+    if (req->rejected)
+        return req_simple_response(
+            req, MHD_HTTP_CONTENT_TOO_LARGE, "Request body too large"
+        );
 
     req_push(req, url, method, version);
 
@@ -433,13 +650,32 @@ static int opt_bool_field(lua_State *L, int idx, const char *name) {
 static void parse_options(lua_State *L, int idx, MhdOptions *opts) {
     long tmp;
     memset(opts, 0, sizeof(*opts));
+    opts->unix_socket_mode = -1;
 
     luaL_checktype(L, idx, LUA_TTABLE);
 
+    lua_getfield(L, idx, "unix_socket");
+    if (lua_isstring(L, -1))
+        opts->unix_socket = lua_tostring(L, -1);
+    else if (!lua_isnil(L, -1))
+        luaL_error(L, "options.unix_socket must be a string");
+    lua_pop(L, 1);
+
     lua_getfield(L, idx, "port");
-    if (!lua_isinteger(L, -1) && !lua_isnumber(L, -1))
-        luaL_error(L, "options.port is required and must be a number");
-    opts->port = (int)lua_tointeger(L, -1);
+    if (!lua_isnil(L, -1)) {
+        if (!lua_isinteger(L, -1) && !lua_isnumber(L, -1))
+            luaL_error(L, "options.port must be a number");
+        opts->port = (int)lua_tointeger(L, -1);
+    } else if (!opts->unix_socket) {
+        luaL_error(
+            L, "options.port is required unless options.unix_socket is given"
+        );
+    }
+    lua_pop(L, 1);
+
+    lua_getfield(L, idx, "unix_socket_mode");
+    if (lua_isnumber(L, -1))
+        opts->unix_socket_mode = (long)lua_tointeger(L, -1);
     lua_pop(L, 1);
 
     opt_number_field(
@@ -470,6 +706,14 @@ static void parse_options(lua_State *L, int idx, MhdOptions *opts) {
     if (opts->has_per_ip_connection_limit)
         opts->per_ip_connection_limit = (unsigned int)tmp;
 
+    int has_max_body = 0;
+    opt_number_field(L, idx, "max_body_size", &has_max_body, &tmp);
+    if (has_max_body) {
+        if (tmp < 0)
+            luaL_error(L, "options.max_body_size must not be negative");
+        opts->max_body_size = (size_t)tmp;
+    }
+
     opts->single_thread = opt_bool_field(L, idx, "single_thread");
     opts->debug = opt_bool_field(L, idx, "debug");
     opts->ipv6 = opt_bool_field(L, idx, "ipv6");
@@ -480,6 +724,76 @@ static void parse_options(lua_State *L, int idx, MhdOptions *opts) {
             "options.thread_pool_size and options.single_thread are "
             "mutually exclusive"
         );
+
+    /* TLS */
+    lua_getfield(L, idx, "tls");
+    if (lua_istable(L, -1)) {
+        int tlsIdx = lua_gettop(L);
+
+        lua_getfield(L, tlsIdx, "key");
+        if (lua_isstring(L, -1))
+            opts->tls_key = lua_tostring(L, -1);
+        lua_pop(L, 1);
+
+        lua_getfield(L, tlsIdx, "cert");
+        if (lua_isstring(L, -1))
+            opts->tls_cert = lua_tostring(L, -1);
+        lua_pop(L, 1);
+
+        lua_getfield(L, tlsIdx, "trust");
+        if (lua_isstring(L, -1))
+            opts->tls_trust = lua_tostring(L, -1);
+        lua_pop(L, 1);
+
+        lua_getfield(L, tlsIdx, "key_password");
+        if (lua_isstring(L, -1))
+            opts->tls_key_password = lua_tostring(L, -1);
+        lua_pop(L, 1);
+
+        if (!opts->tls_key || !opts->tls_cert)
+            luaL_error(
+                L, "options.tls requires both 'key' and 'cert' PEM strings"
+            );
+
+        opts->has_tls = 1;
+    } else if (!lua_isnil(L, -1)) {
+        luaL_error(L, "options.tls must be a table");
+    }
+    lua_pop(L, 1); /* tls */
+}
+
+static int create_unix_socket(const char *path, long mode) {
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0)
+        return -1;
+
+    struct sockaddr_un addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+
+    if (strlen(path) >= sizeof(addr.sun_path)) {
+        close(fd);
+        return -1;
+    }
+    strncpy(addr.sun_path, path, sizeof(addr.sun_path) - 1);
+
+    unlink(path); /* ignore errors: the path may simply not exist yet */
+
+    if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+        close(fd);
+        return -1;
+    }
+
+    if (mode >= 0)
+        chmod(path, (mode_t)mode);
+
+    if (listen(fd, SOMAXCONN) != 0) {
+        close(fd);
+        unlink(path);
+        return -1;
+    }
+
+    return fd;
 }
 
 static struct MHD_Daemon *mhd_start(MhdOptions *opts, void *user) {
@@ -489,6 +803,8 @@ static struct MHD_Daemon *mhd_start(MhdOptions *opts, void *user) {
         flags |= MHD_USE_IPv6;
     if (opts->debug)
         flags |= MHD_USE_DEBUG;
+    if (opts->has_tls)
+        flags |= MHD_USE_TLS;
 
     /* Thread-per-connection is our default threading model, since worker
        state is kept in thread-local storage. A thread pool or a single
@@ -497,7 +813,16 @@ static struct MHD_Daemon *mhd_start(MhdOptions *opts, void *user) {
     if (!opts->has_thread_pool_size && !opts->single_thread)
         flags |= MHD_USE_THREAD_PER_CONNECTION;
 
-    struct MHD_OptionItem items[6];
+    int listen_fd = -1;
+    if (opts->unix_socket) {
+        listen_fd = create_unix_socket(
+            opts->unix_socket, opts->unix_socket_mode
+        );
+        if (listen_fd < 0)
+            return NULL;
+    }
+
+    struct MHD_OptionItem items[12];
     int n = 0;
 
     items[n].option = MHD_OPTION_NOTIFY_COMPLETED;
@@ -533,12 +858,45 @@ static struct MHD_Daemon *mhd_start(MhdOptions *opts, void *user) {
         n++;
     }
 
+    if (opts->has_tls) {
+        items[n].option = MHD_OPTION_HTTPS_MEM_KEY;
+        items[n].value = 0;
+        items[n].ptr_value = (void *)opts->tls_key;
+        n++;
+
+        items[n].option = MHD_OPTION_HTTPS_MEM_CERT;
+        items[n].value = 0;
+        items[n].ptr_value = (void *)opts->tls_cert;
+        n++;
+
+        if (opts->tls_trust) {
+            items[n].option = MHD_OPTION_HTTPS_MEM_TRUST;
+            items[n].value = 0;
+            items[n].ptr_value = (void *)opts->tls_trust;
+            n++;
+        }
+
+        if (opts->tls_key_password) {
+            items[n].option = MHD_OPTION_HTTPS_KEY_PASSWORD;
+            items[n].value = 0;
+            items[n].ptr_value = (void *)opts->tls_key_password;
+            n++;
+        }
+    }
+
+    if (listen_fd >= 0) {
+        items[n].option = MHD_OPTION_LISTEN_SOCKET;
+        items[n].value = (intptr_t)listen_fd;
+        items[n].ptr_value = NULL;
+        n++;
+    }
+
     items[n].option = MHD_OPTION_END;
     items[n].value = 0;
     items[n].ptr_value = NULL;
     n++;
 
-    return MHD_start_daemon(
+    struct MHD_Daemon *daemon = MHD_start_daemon(
         flags,
         (uint16_t)opts->port,
         NULL,
@@ -549,6 +907,13 @@ static struct MHD_Daemon *mhd_start(MhdOptions *opts, void *user) {
         items,
         MHD_OPTION_END
     );
+
+    if (!daemon && listen_fd >= 0) {
+        close(listen_fd);
+        unlink(opts->unix_socket);
+    }
+
+    return daemon;
 }
 
 static int mhd_save_args(lua_State *L, LuaMHDServer *srv, int idx, int argc) {
@@ -601,6 +966,12 @@ static void mhd_free(LuaMHDServer *srv) {
         srv->daemon = NULL;
     }
 
+    if (srv->unix_socket_path) {
+        unlink(srv->unix_socket_path);
+        free(srv->unix_socket_path);
+        srv->unix_socket_path = NULL;
+    }
+
     for (int i = 0; i < srv->argc; i++) {
         if (srv->argv[i].type == LUA_TSTRING) {
             srv->argv[i].type = LUA_TNIL;
@@ -623,6 +994,9 @@ static int mhd_wrap(
     srv->port = opts->port;
     srv->script = script;
     srv->length = length;
+    srv->max_body_size = opts->max_body_size;
+    srv->unix_socket_path = opts->unix_socket ? strdup(opts->unix_socket)
+                                              : NULL;
     srv->daemon = mhd_start(opts, srv);
 
     luaL_getmetatable(L, LUA_MHD_SERVER);
@@ -630,6 +1004,12 @@ static int mhd_wrap(
 
     if (!srv->daemon || mhd_save_args(L, srv, idx, argc)) {
         mhd_free(srv);
+        if (opts->unix_socket)
+            return luaL_error(
+                L,
+                "MHD_start_daemon failed on unix socket '%s'",
+                opts->unix_socket
+            );
         return luaL_error(L, "MHD_start_daemon failed on port %d", srv->port);
     }
 
@@ -705,6 +1085,12 @@ static int server_stop(lua_State *L) {
     if (srv->daemon) {
         MHD_stop_daemon(srv->daemon);
         srv->daemon = NULL;
+    }
+
+    if (srv->unix_socket_path) {
+        unlink(srv->unix_socket_path);
+        free(srv->unix_socket_path);
+        srv->unix_socket_path = NULL;
     }
 
     return 0;

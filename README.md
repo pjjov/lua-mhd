@@ -19,6 +19,9 @@ Lua bindings for GNU libmicrohttpd, providing a simple way to build multithreade
 * Each worker thread uses its own `lua_State`
 * Supports loading worker scripts from source strings, files, or Lua callbacks
 * Simple request/response API
+* TLS/HTTPS, Unix domain sockets, and thread-pool tuning via an options table
+* Static file serving, HTTP Basic/Digest authentication helpers
+* Configurable request body size limits
 * Compatible with LuaRocks
 
 ## Installation
@@ -56,14 +59,18 @@ underlying `MHD_Daemon`.
 
 | Field                      | Type    | Default | Description                                                              |
 | -------------------------- | ------- | ------- | ------------------------------------------------------------------------ |
-| `port`                     | number  | —       | **Required.** TCP port to listen on.                                     |
+| `port`                     | number  | —       | TCP port to listen on. Required unless `unix_socket` is given.          |
+| `unix_socket`               | string  | none    | Path to a Unix domain socket to listen on instead of a TCP port.        |
+| `unix_socket_mode`          | number  | none    | `chmod` mode applied to the socket file (e.g. `tonumber("660", 8)`).     |
 | `thread_pool_size`         | number  | none    | Use a fixed-size internal thread pool instead of one thread per connection. |
 | `single_thread`            | boolean | `false` | Run the daemon on a single internal thread. Mutually exclusive with `thread_pool_size`. |
 | `connection_limit`         | number  | none    | Maximum number of concurrent connections.                                |
 | `connection_timeout`       | number  | none    | Idle connection timeout, in seconds.                                     |
 | `per_ip_connection_limit`  | number  | none    | Maximum number of concurrent connections per client IP.                  |
+| `max_body_size`             | number  | none    | Maximum request body size, in bytes. Larger bodies get a `413`.         |
 | `debug`                    | boolean | `false` | Enable libmicrohttpd's internal debug/verbose logging.                   |
 | `ipv6`                     | boolean | `false` | Listen on IPv6 in addition to IPv4.                                      |
+| `tls`                       | table   | none    | Enables HTTPS. See [TLS / HTTPS](#tls--https) below.                    |
 
 By default (no `thread_pool_size` or `single_thread` given), the daemon uses
 one thread per connection, which matches the [threading model](#threading-model)
@@ -81,12 +88,68 @@ local srv = mhd.start({
   thread_pool_size = 4,
   connection_timeout = 30,
   connection_limit = 1000,
+  max_body_size = 10 * 1024 * 1024, -- 10 MiB
 }, function()
   return function(req)
     return { code = 200, body = "Hello, world!" }
   end
 end)
 ```
+
+### TLS / HTTPS
+
+Pass a `tls` table with PEM-encoded `key` and `cert` strings to serve HTTPS
+instead of plain HTTP:
+
+```lua
+local function readFile(path)
+  local f = assert(io.open(path, "rb"))
+  local data = f:read("a")
+  f:close()
+  return data
+end
+
+local srv = mhd.start({
+  port = 8443,
+  tls = {
+    key = readFile("key.pem"),
+    cert = readFile("cert.pem"),
+  },
+}, function()
+  return function(req)
+    return { code = 200, body = "Hello over HTTPS!" }
+  end
+end)
+```
+
+#### `tls` fields
+
+| Field          | Type   | Description                                                        |
+| -------------- | ------ | ------------------------------------------------------------------ |
+| `key`          | string | **Required.** Private key, PEM-encoded.                            |
+| `cert`         | string | **Required.** Certificate, PEM-encoded.                             |
+| `trust`        | string | Optional CA/trust chain, PEM-encoded, for verifying client certs.   |
+| `key_password` | string | Optional password if `key` is encrypted.                            |
+
+### Unix Domain Sockets
+
+Set `unix_socket` instead of `port` to listen on a Unix domain socket —
+useful when running behind a reverse proxy like nginx:
+
+```lua
+local srv = mhd.start({
+  unix_socket = "/run/myapp/server.sock",
+  unix_socket_mode = tonumber("660", 8),
+}, function()
+  return function(req)
+    return { code = 200, body = "Hello via Unix socket!" }
+  end
+end)
+```
+
+The socket file is created (replacing any stale file at the same path) when
+the server starts, and removed automatically when the server is stopped,
+garbage collected, or fails to start.
 
 ### Worker Initialization
 
@@ -216,23 +279,116 @@ Incoming requests are provided as a Lua table:
   query = {
     q = "search term"
   },
-  body = "Request body"
+  body = "Request body",
+  basic_auth = {
+    username = "alice",
+    password = "secret"
+  },
+  digest_username = "alice",
+  check_digest = function(realm, username, password) ... end
 }
 ```
 
 ### Fields
 
-| Field     | Type   | Description           |
-| --------- | ------ | --------------------- |
-| `method`  | string | HTTP request method   |
-| `url`     | string | Requested URL         |
-| `version` | string | HTTP protocol version |
-| `headers` | table  | Request headers       |
-| `query`   | table  | Parsed query string parameters |
-| `body`    | string | Request body          |
+| Field             | Type     | Description                                                        |
+| ----------------- | -------- | ------------------------------------------------------------------ |
+| `method`          | string   | HTTP request method                                                 |
+| `url`             | string   | Requested URL                                                       |
+| `version`         | string   | HTTP protocol version                                                |
+| `headers`         | table    | Request headers                                                     |
+| `query`           | table    | Parsed query string parameters                                      |
+| `body`            | string   | Request body                                                        |
+| `basic_auth`      | table    | Present if the client sent an `Authorization: Basic` header. See below. |
+| `digest_username` | string   | Present if the client sent an `Authorization: Digest` header.       |
+| `check_digest`    | function | Verifies a Digest Authentication response. See below.               |
 
 Note: if a query parameter is repeated (e.g. `?tag=a&tag=b`), only the last
 value is kept in the `query` table.
+
+## Authentication
+
+### HTTP Basic Authentication
+
+If the client sent an `Authorization: Basic` header, it is parsed
+automatically and made available as `req.basic_auth`:
+
+```lua
+return function(req)
+  local auth = req.basic_auth
+  if auth and auth.username == "alice" and auth.password == "secret" then
+    return { code = 200, body = "welcome, alice" }
+  end
+
+  return {
+    code = 401,
+    body = "Access denied",
+    headers = { ["WWW-Authenticate"] = 'Basic realm="my-realm"' }
+  }
+end
+```
+
+`auth.password` may be `nil` if the client didn't send one.
+
+### HTTP Digest Authentication
+
+Digest authentication needs cooperation from libmicrohttpd itself (to
+generate and validate nonces), so it works a little differently. The
+client's username is exposed as `req.digest_username`, letting the script
+look up the corresponding password (e.g. from a database); the response is
+then verified with `req.check_digest(realm, username, password)`:
+
+```lua
+local function lookupPassword(username)
+  -- e.g. a database lookup; here, a fixed "user database"
+  local passwords = { alice = "secret" }
+  return passwords[username]
+end
+
+return function(req)
+  local username = req.digest_username
+  local password = username and lookupPassword(username)
+
+  if password then
+    local ok = req.check_digest("my-realm", username, password)
+    if ok == true then
+      return { code = 200, body = "welcome, " .. username }
+    end
+  end
+
+  return {
+    code = 401,
+    body = "Access denied",
+    digest_challenge = { realm = "my-realm" }
+  }
+end
+```
+
+`req.check_digest(realm, username, password, [opts])` returns:
+
+* `true` — authentication succeeded.
+* `false` — authentication failed (wrong password, malformed header, etc).
+* `"stale"` — the credentials were previously valid but the nonce has
+  expired; ask the client to retry (it will, transparently, using the same
+  username/password).
+
+`opts` is an optional table with:
+
+| Field           | Type   | Default | Description                                      |
+| --------------- | ------ | ------- | ------------------------------------------------- |
+| `algorithm`     | string | `"MD5"` | `"MD5"`, `"SHA256"`, or `"any"` to accept either. |
+| `nonce_timeout` | number | daemon default | How long (seconds) a nonce remains valid. |
+
+`digest_challenge` on a **response** table (see below) turns that response
+into a proper `WWW-Authenticate: Digest ...` challenge instead of sending
+it as-is:
+
+| Field       | Type    | Description                                             |
+| ----------- | ------- | -------------------------------------------------------- |
+| `realm`     | string  | Realm presented to the client.                            |
+| `opaque`    | string  | Optional opaque value echoed back by the client.          |
+| `stale`     | boolean | Set when re-challenging after a `"stale"` result, so the client retries automatically. |
+| `algorithm` | string  | `"MD5"` (default), `"SHA256"`, or `"any"`.                |
 
 ## Response Object
 
@@ -248,13 +404,36 @@ Request handlers should return a response table:
 }
 ```
 
+Instead of `body`, a response can set `file` to have libmicrohttpd stream a
+file from disk directly (using `sendfile` where supported), which avoids
+reading the whole file into memory yourself:
+
+```lua
+return function(req)
+  return {
+    code = 200,
+    file = "/var/www/static/logo.png",
+    headers = { ["Content-Type"] = "image/png" }
+  }
+end
+```
+
+If the file cannot be opened (missing, permissions, not a regular file), a
+`404 Not Found` is sent automatically instead, and `code`/`headers` are
+ignored for that response.
+
 ### Fields
 
-| Field     | Type   | Description      |
-| --------- | ------ | ---------------- |
-| `code`    | number | HTTP status code |
-| `body`    | string | Response body    |
-| `headers` | table  | Response headers |
+| Field              | Type   | Description                                                        |
+| ------------------ | ------ | ------------------------------------------------------------------- |
+| `code`             | number | HTTP status code                                                     |
+| `body`             | string | Response body. Ignored if `file` is set.                             |
+| `file`             | string | Path to a file to serve as the response body, streamed by libmicrohttpd. |
+| `headers`          | table  | Response headers                                                     |
+| `digest_challenge` | table  | Turns this response into an HTTP Digest Authentication challenge. See [Authentication](#authentication). |
+
+Note: range requests (`Range:` header, partial content) aren't handled
+specially for `file` responses — the whole file is sent every time.
 
 ## Complete Example
 

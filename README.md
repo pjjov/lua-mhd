@@ -21,6 +21,7 @@ Lua bindings for GNU libmicrohttpd, providing a simple way to build multithreade
 * Simple request/response API
 * TLS/HTTPS, Unix domain sockets, and thread-pool tuning via an options table
 * Static file serving, HTTP Basic/Digest authentication helpers
+* Streaming request and response bodies
 * Configurable request body size limits
 * Compatible with LuaRocks
 
@@ -170,6 +171,10 @@ function workerScript(...)
   end
 end
 ```
+
+Alternatively, it may return a table with a `handle` function and an
+optional `on_data` function, to stream the request body instead of
+buffering it — see [Streaming Requests](#streaming-requests).
 
 ### Using `mhd.start`
 
@@ -427,13 +432,95 @@ ignored for that response.
 | Field              | Type   | Description                                                        |
 | ------------------ | ------ | ------------------------------------------------------------------- |
 | `code`             | number | HTTP status code                                                     |
-| `body`             | string | Response body. Ignored if `file` is set.                             |
+| `body`             | string | Response body. Ignored if `file` or `stream` is set.                 |
 | `file`             | string | Path to a file to serve as the response body, streamed by libmicrohttpd. |
+| `stream`           | function | Produces the response body incrementally. See [Streaming Responses](#streaming-responses). |
+| `stream_size`      | number | Total response size in bytes, if known in advance. Only used with `stream`. |
 | `headers`          | table  | Response headers                                                     |
 | `digest_challenge` | table  | Turns this response into an HTTP Digest Authentication challenge. See [Authentication](#authentication). |
 
 Note: range requests (`Range:` header, partial content) aren't handled
 specially for `file` responses — the whole file is sent every time.
+
+## Streaming Responses
+
+Instead of `body`, a response can set `stream` to a function that produces
+the body incrementally. `lua-mhd` calls it repeatedly, sending each chunk
+to the client as it's produced, instead of requiring the whole body to be
+built as one Lua string up front:
+
+```lua
+return function(req)
+  local n = 0
+
+  return {
+    code = 200,
+    headers = { ["Content-Type"] = "text/plain" },
+    stream = function()
+      n = n + 1
+      if n > 5 then
+        return nil -- ends the response
+      end
+      return "chunk " .. n .. "\n"
+    end
+  }
+end
+```
+
+The function is called with no arguments and should return the next chunk
+as a string. Returning `nil`, `false`, or an empty string ends the
+response. If the function raises an error, the response ends there and the
+error is logged to stderr — by that point headers (and possibly some body
+bytes) have already been sent to the client, so the error can't be turned
+into a clean HTTP error response anymore; keep any validation that can fail
+outside the `stream` function where possible.
+
+If the total size is known ahead of time, set `stream_size` (in bytes) so
+`lua-mhd` can send a proper `Content-Length` header instead of
+`Transfer-Encoding: chunked`:
+
+```lua
+return {
+  code = 200,
+  stream_size = fileSize,
+  stream = function() ... end
+}
+```
+
+## Streaming Requests
+
+By default, the request body is fully read into memory (available as
+`req.body`) before the handler function is called. For large uploads, a
+worker can instead return a table with `on_data`, which is called once per
+chunk **as it arrives**, so the body is never buffered in memory:
+
+```lua
+function workerScript(...)
+  return {
+    on_data = function(req, chunk)
+      -- called once per incoming chunk, in order, before `handle` runs
+      req.total = (req.total or 0) + #chunk
+    end,
+
+    handle = function(req)
+      -- req.body is NOT populated when on_data is used
+      return { code = 200, body = "received " .. (req.total or 0) .. " bytes" }
+    end
+  }
+end
+```
+
+`req` is the same table across every `on_data` call and the final `handle`
+call for a given request, so it's a convenient place to accumulate state
+(write chunks to a file, hash them, parse them incrementally, etc). If
+`on_data` raises an error, the upload is stopped, `handle` is never called,
+and a `500 Internal Server Error` is sent once the connection has finished
+draining.
+
+`options.max_body_size` (see [Server Options](#server-options)) is
+enforced the same way for streamed requests as for buffered ones — it
+tracks total bytes received rather than buffer size, so it works whether
+or not `on_data` is used.
 
 ## Complete Example
 

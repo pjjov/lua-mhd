@@ -114,7 +114,11 @@ typedef struct Request {
     struct MHD_Connection *connection;
     LuaMHDServer *server;
     Buffer buffer;
+    size_t received; /* total body bytes seen so far (streaming or not) */
     int rejected;
+    int streaming;     /* true if the worker registered an on_data handler */
+    int req_table_ref; /* LUA_NOREF unless streaming */
+    int handler_error; /* true if on_data raised a Lua error */
 } Request;
 
 /*
@@ -191,13 +195,42 @@ static lua_State *create_thread_state(LuaMHDServer *srv) {
         return NULL;
     }
 
-    if (!lua_isfunction(L, -1)) {
-        fprintf(stderr, "[lua_mhd] Script must return a function\n");
+    /* The worker script may return either a bare handler function (the
+       request body is fully buffered before it is called, as before), or
+       a table { handle = fn, on_data = fn } where `on_data` is invoked
+       once per incoming chunk so large bodies never need to be buffered
+       in memory. */
+    if (lua_isfunction(L, -1)) {
+        lua_pushnil(L);
+        lua_setfield(L, LUA_REGISTRYINDEX, "mhd_on_data");
+        lua_setfield(L, LUA_REGISTRYINDEX, "mhd_handler");
+    } else if (lua_istable(L, -1)) {
+        lua_getfield(L, -1, "handle");
+        if (!lua_isfunction(L, -1)) {
+            fprintf(stderr, "[lua_mhd] options.handle must be a function\n");
+            lua_close(L);
+            return NULL;
+        }
+        lua_setfield(L, LUA_REGISTRYINDEX, "mhd_handler");
+
+        lua_getfield(L, -1, "on_data");
+        if (!lua_isfunction(L, -1)) {
+            lua_pop(L, 1);
+            lua_pushnil(L);
+        }
+        lua_setfield(L, LUA_REGISTRYINDEX, "mhd_on_data");
+
+        lua_pop(L, 1); /* the options table itself */
+    } else {
+        fprintf(
+            stderr,
+            "[lua_mhd] Script must return a function or a table with a "
+            "'handle' function\n"
+        );
         lua_close(L);
         return NULL;
     }
 
-    lua_setfield(L, LUA_REGISTRYINDEX, "mhd_handler");
     return L;
 }
 
@@ -235,6 +268,7 @@ static Request *req_new(LuaMHDServer *srv, struct MHD_Connection *conn) {
     req->state = get_thread_state(srv);
     req->connection = conn;
     req->server = srv;
+    req->req_table_ref = LUA_NOREF;
 
     if (!req->state) {
         req_simple_response(
@@ -245,6 +279,10 @@ static Request *req_new(LuaMHDServer *srv, struct MHD_Connection *conn) {
         free(req);
         return NULL;
     }
+
+    lua_getfield(req->state, LUA_REGISTRYINDEX, "mhd_on_data");
+    req->streaming = lua_isfunction(req->state, -1);
+    lua_pop(req->state, 1);
 
     return req;
 }
@@ -260,6 +298,8 @@ static void req_free(
     (void)toe;
     if (*con_cls) {
         Request *req = *con_cls;
+        if (req->state && req->req_table_ref != LUA_NOREF)
+            luaL_unref(req->state, LUA_REGISTRYINDEX, req->req_table_ref);
         free(req->buffer.data);
         free(req);
         *con_cls = NULL;
@@ -347,11 +387,14 @@ static int l_req_check_digest(lua_State *L) {
     return 1;
 }
 
-static int req_push(
+/* Builds the request table (method/url/version/headers/query/auth helpers)
+   on top of the Lua stack, leaving `body` as an empty string — callers fill
+   that in themselves depending on whether the body is buffered or
+   streamed. */
+static void req_build_common(
     Request *req, const char *url, const char *method, const char *version
 ) {
     lua_State *L = req->state;
-    lua_getfield(L, LUA_REGISTRYINDEX, "mhd_handler");
 
     lua_newtable(L); /* request table */
     lua_pushstring(L, method ? method : "");
@@ -371,11 +414,7 @@ static int req_push(
     );
     lua_setfield(L, -2, "query");
 
-    if (req->buffer.length > 0)
-        lua_pushlstring(L, req->buffer.data, req->buffer.length);
-    else
-        lua_pushstring(L, "");
-
+    lua_pushstring(L, "");
     lua_setfield(L, -2, "body");
 
     /* HTTP Basic authentication, parsed for convenience. */
@@ -413,8 +452,60 @@ static int req_push(
     lua_pushlightuserdata(L, req);
     lua_pushcclosure(L, l_req_check_digest, 1);
     lua_setfield(L, -2, "check_digest");
+}
+
+/* Non-streaming path: build the request table (with the fully-buffered
+   body) and push the handler function ready for a single lua_pcall. */
+static int req_push(
+    Request *req, const char *url, const char *method, const char *version
+) {
+    lua_State *L = req->state;
+    lua_getfield(L, LUA_REGISTRYINDEX, "mhd_handler");
+
+    req_build_common(req, url, method, version);
+
+    if (req->buffer.length > 0) {
+        lua_pushlstring(L, req->buffer.data, req->buffer.length);
+        lua_setfield(L, -2, "body");
+    }
 
     return MHD_YES;
+}
+
+/* Streaming path: build the request table once, up front (headers/query
+   are already available before any body data arrives), and keep a
+   registry reference to it so on_data() can be called repeatedly with it
+   as chunks arrive, without rebuilding it each time. */
+static void req_build_table(
+    Request *req, const char *url, const char *method, const char *version
+) {
+    lua_State *L = req->state;
+    req_build_common(req, url, method, version);
+    req->req_table_ref = luaL_ref(L, LUA_REGISTRYINDEX);
+}
+
+/* Calls the worker's on_data(req, chunk) for one incoming chunk. Returns
+   0 on success, -1 if the callback raised a Lua error. On error, no
+   response is queued here — the caller must defer that until the body is
+   fully drained, since queuing a response mid-upload can hang the
+   connection with some libmicrohttpd versions. */
+static int req_on_data(Request *req, const char *chunk, size_t len) {
+    lua_State *L = req->state;
+
+    lua_getfield(L, LUA_REGISTRYINDEX, "mhd_on_data");
+    lua_rawgeti(L, LUA_REGISTRYINDEX, req->req_table_ref);
+    lua_pushlstring(L, chunk, len);
+
+    if (lua_pcall(L, 2, 0, 0) != LUA_OK) {
+        const char *err = lua_tostring(L, -1);
+        fprintf(
+            stderr, "[lua_mhd] on_data error: %s\n", err ? err : "(unknown)"
+        );
+        lua_pop(L, 1);
+        return -1;
+    }
+
+    return 0;
 }
 
 static int req_handle(Request *req) {
@@ -431,6 +522,7 @@ static int req_handle(Request *req) {
             "function"
         );
 
+        lua_pop(L, 1); /* pop the error message */
         return -1;
     }
 
@@ -510,6 +602,79 @@ static enum MHD_Result res_queue(
     return ret;
 }
 
+typedef struct StreamCtx {
+    lua_State *L;
+    int ref;
+    char *pending;
+    size_t pending_len;
+    size_t pending_off;
+    int done;
+} StreamCtx;
+
+static ssize_t stream_reader(void *cls, uint64_t pos, char *buf, size_t max) {
+    (void)pos;
+    StreamCtx *ctx = (StreamCtx *)cls;
+    lua_State *L = ctx->L;
+
+    if (ctx->pending_off >= ctx->pending_len) {
+        free(ctx->pending);
+        ctx->pending = NULL;
+        ctx->pending_len = 0;
+        ctx->pending_off = 0;
+
+        if (ctx->done)
+            return MHD_CONTENT_READER_END_OF_STREAM;
+
+        lua_rawgeti(L, LUA_REGISTRYINDEX, ctx->ref);
+
+        if (lua_pcall(L, 0, 1, 0) != LUA_OK) {
+            const char *err = lua_tostring(L, -1);
+            fprintf(
+                stderr, "[lua_mhd] stream error: %s\n", err ? err : "(unknown)"
+            );
+            lua_pop(L, 1);
+            ctx->done = 1;
+            return MHD_CONTENT_READER_END_WITH_ERROR;
+        }
+
+        size_t len;
+        const char *chunk = lua_tolstring(L, -1, &len);
+
+        if (!chunk || len == 0) {
+            lua_pop(L, 1);
+            ctx->done = 1;
+            return MHD_CONTENT_READER_END_OF_STREAM;
+        }
+
+        ctx->pending = malloc(len);
+        if (!ctx->pending) {
+            lua_pop(L, 1);
+            ctx->done = 1;
+            return MHD_CONTENT_READER_END_WITH_ERROR;
+        }
+
+        memcpy(ctx->pending, chunk, len);
+        ctx->pending_len = len;
+        ctx->pending_off = 0;
+        lua_pop(L, 1);
+    }
+
+    size_t avail = ctx->pending_len - ctx->pending_off;
+    size_t n = avail < max ? avail : max;
+    memcpy(buf, ctx->pending + ctx->pending_off, n);
+    ctx->pending_off += n;
+    return (ssize_t)n;
+}
+
+static void stream_free(void *cls) {
+    StreamCtx *ctx = (StreamCtx *)cls;
+    if (!ctx)
+        return;
+    luaL_unref(ctx->L, LUA_REGISTRYINDEX, ctx->ref);
+    free(ctx->pending);
+    free(ctx);
+}
+
 static enum MHD_Result res_send(Request *req) {
     lua_State *L = req->state;
     lua_getfield(L, -1, "code");
@@ -521,6 +686,36 @@ static enum MHD_Result res_send(Request *req) {
 
     unsigned int code = (unsigned int)lua_tointeger(L, -1);
     lua_pop(L, 1);
+
+    /* Streaming responses: { code = 200, stream = function() ... end }
+       lets the script produce the body incrementally instead of building
+       the whole thing as one Lua string up front. The function is called
+       repeatedly; returning nil/false/"" ends the response. */
+    lua_getfield(L, -1, "stream");
+    if (lua_isfunction(L, -1)) {
+        StreamCtx *ctx = calloc(1, sizeof(StreamCtx));
+        ctx->L = L;
+        ctx->ref = luaL_ref(L, LUA_REGISTRYINDEX); /* pops the function */
+
+        uint64_t size = MHD_SIZE_UNKNOWN;
+        lua_getfield(L, -1, "stream_size");
+        if (lua_isnumber(L, -1))
+            size = (uint64_t)lua_tointeger(L, -1);
+        lua_pop(L, 1);
+
+        struct MHD_Response *res = MHD_create_response_from_callback(
+            size, 8192, stream_reader, ctx, stream_free
+        );
+
+        if (!res) {
+            stream_free(ctx);
+            return MHD_NO;
+        }
+
+        res_add_headers(req, res);
+        return res_queue(req, res, code);
+    }
+    lua_pop(L, 1); /* stream (nil or non-function) */
 
     /* Static file serving: { code = 200, file = "/path/to/file" } lets MHD
        stream the file directly (via sendfile where supported) instead of
@@ -572,6 +767,26 @@ static enum MHD_Result res_send(Request *req) {
     return res_queue(req, res, code);
 }
 
+/* Finishes a streamed request: fetches the handler and the request table
+   built earlier by req_build_table, releases the registry ref, and calls
+   the handler exactly like the non-streaming path does. */
+static enum MHD_Result req_finish_streaming(Request *req) {
+    lua_State *L = req->state;
+
+    lua_getfield(L, LUA_REGISTRYINDEX, "mhd_handler");
+    lua_rawgeti(L, LUA_REGISTRYINDEX, req->req_table_ref);
+
+    luaL_unref(L, LUA_REGISTRYINDEX, req->req_table_ref);
+    req->req_table_ref = LUA_NOREF;
+
+    if (req_handle(req))
+        return MHD_YES;
+
+    enum MHD_Result ret = res_send(req);
+    lua_pop(L, 1); /* pop the response table left by req_handle's pcall */
+    return ret;
+}
+
 static MHD_Result_t access_handler(
     void *cls,
     struct MHD_Connection *connection,
@@ -588,12 +803,16 @@ static MHD_Result_t access_handler(
     if (req == NULL) {
         req = req_new(srv, connection);
         *con_cls = req;
+
+        if (req && req->streaming)
+            req_build_table(req, url, method, version);
+
         return MHD_YES;
     }
 
     if (*upload_data_size > 0) {
         if (!req->rejected && srv->max_body_size > 0
-            && req->buffer.length + *upload_data_size > srv->max_body_size)
+            && req->received + *upload_data_size > srv->max_body_size)
             req->rejected = 1;
 
         if (req->rejected) {
@@ -601,24 +820,50 @@ static MHD_Result_t access_handler(
             return MHD_YES;
         }
 
+        if (req->streaming) {
+            if (req_on_data(req, upload_data, *upload_data_size)) {
+                req->rejected = 1;
+                req->handler_error = 1;
+                *upload_data_size = 0;
+                return MHD_YES;
+            }
+            req->received += *upload_data_size;
+            *upload_data_size = 0;
+            return MHD_YES;
+        }
+
         size_t recv = buffer_append(
             &req->buffer, upload_data, *upload_data_size
         );
+        req->received += recv;
         *upload_data_size -= recv;
         return MHD_YES;
     }
 
-    if (req->rejected)
+    if (req->rejected) {
+        if (req->handler_error)
+            return req_simple_response(
+                req,
+                MHD_HTTP_INTERNAL_SERVER_ERROR,
+                "Internal Script Error: An error occured in the Lua "
+                "on_data handler"
+            );
         return req_simple_response(
             req, MHD_HTTP_CONTENT_TOO_LARGE, "Request body too large"
         );
+    }
+
+    if (req->streaming)
+        return req_finish_streaming(req);
 
     req_push(req, url, method, version);
 
     if (req_handle(req))
         return MHD_YES;
 
-    return res_send(req);
+    enum MHD_Result ret = res_send(req);
+    lua_pop(req->state, 1); /* pop the response table left by req_handle */
+    return ret;
 }
 
 /*
